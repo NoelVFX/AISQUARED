@@ -19,7 +19,7 @@ from torch.nn import functional as F
 from torch import nn as nn
 import numpy as np
 import pygame
-from stable_baselines3 import A2C, PPO, SAC, DQN, DDPG, TD3, HER 
+from stable_baselines3 import A2C, PPO, SAC, DQN, DDPG, TD3, HER
 from sb3_contrib import RecurrentPPO
 from stable_baselines3.common.base_class import BaseAlgorithm
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
@@ -474,18 +474,6 @@ def recovery_reward(env: WarehouseBrawl) -> float:
             return 0.1
     return 0.0
 
-def ledge_risk_penalty(env: WarehouseBrawl) -> float:
-    """Penalty for being near edges"""
-    player: Player = env.objects["player"]
-    
-    ledge_distance = min(abs(player.body.position.x - 5.33), 
-                        abs(player.body.position.x + 5.33))
-    
-    # Penalty for being near ledge
-    if ledge_distance < 1.0:
-        return -0.1 * env.dt
-    return 0.0
-
 def combo_efficiency_reward(env: WarehouseBrawl) -> float:
     """Reward for efficient combo execution"""
     # Track consecutive hits (simplified implementation)
@@ -506,33 +494,618 @@ def init_damage_tracking(env: WarehouseBrawl):
     if not hasattr(player, 'prev_damage'):
         player.prev_damage = player.damage
 
+def ledge_penalty_reward(env: WarehouseBrawl) -> float:
+    """Smarter ledge detection that allows platform navigation"""
+    player: Player = env.objects["player"]
+    
+    player_x, player_y = player.body.position.x, player.body.position.y
+    
+    # Stage boundaries (adjust based on your stage)
+    left_ledge = -5.0
+    right_ledge = 5.0
+    
+    # Only penalize if actually falling off (low Y) and near edge
+    if player_y < -2.0:  # Actually falling
+        if player_x < left_ledge + 0.5 or player_x > right_ledge - 0.5:
+            return -0.5 * env.dt
+    
+    # Less penalty for being near edge but on platform or high up
+    if player_y > 1.0:  # On platform or in air
+        if player_x < left_ledge + 0.3 or player_x > right_ledge - 0.3:
+            return -0.1 * env.dt  # Smaller penalty
+    
+    return 0.0
+
+def suicide_penalty_reward(env: WarehouseBrawl) -> float:
+    """Massive penalty for falling off"""
+    player: Player = env.objects["player"]
+    
+    # Check if player is falling off (adjust threshold based on your stage)
+    if player.body.position.y < -10.0:  # Fell off bottom
+        return -10.0
+    return 0.0
+
+def center_stage_bonus_reward(env: WarehouseBrawl) -> float:
+    """Reward for staying near center"""
+    player: Player = env.objects["player"]
+    
+    distance_from_center = abs(player.body.position.x)
+    
+    # Reward for being in center area
+    if distance_from_center < 2.0:
+        return 0.1 * env.dt
+    return 0.0
+
+def aggression_reward(env: WarehouseBrawl) -> float:
+    """Reward for being close to opponent and in attack position"""
+    player: Player = env.objects["player"]
+    opponent: Player = env.objects["opponent"]
+    
+    distance = abs(player.body.position.x - opponent.body.position.x)
+    
+    # Reward for being in optimal attack range
+    if 1.0 <= distance <= 3.0:
+        return 0.2 * env.dt
+    # Small penalty for being too far
+    elif distance > 5.0:
+        return -0.1 * env.dt
+    return 0.0
+
+def attack_frequency_reward(env: WarehouseBrawl) -> float:
+    """Reward for frequently attempting attacks"""
+    player: Player = env.objects["player"]
+    
+    # Check if player is in attack state
+    state_name = player.state.__class__.__name__
+    
+    if "Attack" in state_name:
+        return 0.15 * env.dt
+    return 0.0
+
+def smart_closing_distance_reward(env: WarehouseBrawl) -> float:
+    """Reward for moving toward opponent only when safe"""
+    player: Player = env.objects["player"]
+    opponent: Player = env.objects["opponent"]
+    
+    if not hasattr(env, 'prev_distance'):
+        env.prev_distance = abs(player.body.position.x - opponent.body.position.x)
+        return 0.0
+    
+    current_distance = abs(player.body.position.x - opponent.body.position.x)
+    distance_change = env.prev_distance - current_distance  # Positive = getting closer
+    
+    env.prev_distance = current_distance
+    
+    # Only reward closing distance when not near edges
+    player_x, player_y = player.body.position.x, player.body.position.y
+    stage_half_width = 5.0
+    
+    # Check if safe to approach (not near edges)
+    is_safe = abs(player_x) < stage_half_width - 1.0
+    
+    if distance_change > 0.1 and is_safe:  # Getting closer and safe
+        return 0.1
+    elif distance_change < -0.1 and is_safe:  # Moving away and safe
+        return -0.05
+    elif not is_safe and distance_change > 0.1:  # Getting closer but near edge
+        return 0.02  # Small reward to encourage careful approach
+    elif not is_safe and distance_change < -0.1:  # Moving away from edge - good!
+        return 0.05  # Reward moving away from edges
+    
+    return 0.0
+
+def combo_aggression_reward(env: WarehouseBrawl) -> float:
+    """Reward for continuous aggressive actions"""
+    player: Player = env.objects["player"]
+    opponent: Player = env.objects["opponent"]
+    
+    if not hasattr(env, 'aggression_counter'):
+        env.aggression_counter = 0
+        env.last_aggression_step = 0
+    
+    current_step = getattr(env, 'step_count', 0)
+    
+    # Check for aggressive actions
+    state_name = player.state.__class__.__name__
+    distance = abs(player.body.position.x - opponent.body.position.x)
+    
+    is_aggressive = (
+        "Attack" in state_name or 
+        distance < 3.0 or
+        opponent.damage_taken_this_frame > 0
+    )
+    
+    if is_aggressive:
+        env.aggression_counter += 1
+        env.last_aggression_step = current_step
+    else:
+        # Reset if too much time passes without aggression
+        if current_step - env.last_aggression_step > 60:  # 2 seconds at 30fps
+            env.aggression_counter = 0
+    
+    # Reward sustained aggression
+    if env.aggression_counter > 10:
+        return 0.05 * min(env.aggression_counter / 10, 3.0)  # Cap at 3x bonus
+    return 0.0
+
+def pressure_reward(env: WarehouseBrawl) -> float:
+    """Reward for keeping pressure on opponent (being close when opponent is vulnerable)"""
+    player: Player = env.objects["player"]
+    opponent: Player = env.objects["opponent"]
+    
+    distance = abs(player.body.position.x - opponent.body.position.x)
+    opp_state_name = opponent.state.__class__.__name__
+    
+    # Opponent is vulnerable if in hitstun, knockdown, or recovery
+    is_opponent_vulnerable = any(state in opp_state_name for state in ['Hit', 'Knockdown', 'Stun', 'Recovery'])
+    
+    if is_opponent_vulnerable and distance < 3.0:
+        return 0.3 * env.dt  # Big reward for pressuring vulnerable opponent
+    elif is_opponent_vulnerable and distance < 5.0:
+        return 0.1 * env.dt  # Smaller reward for being somewhat close
+    
+    return 0.0
+
+def offensive_positioning_reward(env: WarehouseBrawl) -> float:
+    """Reward for maintaining offensive positioning (higher ground, center control, etc.)"""
+    player: Player = env.objects["player"]
+    opponent: Player = env.objects["opponent"]
+    
+    reward = 0.0
+    
+    # Reward for having height advantage
+    if player.body.position.y > opponent.body.position.y + 0.5:
+        reward += 0.05 * env.dt
+    
+    # Reward for having center stage advantage
+    player_dist_from_center = abs(player.body.position.x)
+    opp_dist_from_center = abs(opponent.body.position.x)
+    
+    if player_dist_from_center < opp_dist_from_center:
+        reward += 0.03 * env.dt
+    
+    # Reward for being closer to opponent (aggressive positioning)
+    distance = abs(player.body.position.x - opponent.body.position.x)
+    if distance < 3.0:
+        reward += 0.04 * env.dt
+    
+    return reward
+
+def safe_relentless_reward(env: WarehouseBrawl) -> float:
+    """Reward for continuous movement toward opponent only when safe"""
+    player: Player = env.objects["player"]
+    opponent: Player = env.objects["opponent"]
+    
+    if not hasattr(env, 'prev_player_x'):
+        env.prev_player_x = player.body.position.x
+        return 0.0
+    
+    player_to_opponent = opponent.body.position.x - player.body.position.x
+    movement = player.body.position.x - env.prev_player_x
+    
+    env.prev_player_x = player.body.position.x
+    
+    # Check safety conditions
+    player_x, player_y = player.body.position.x, player.body.position.y
+    stage_half_width = 5.0
+    is_safe = abs(player_x) < stage_half_width - 1.0
+    
+    # Only reward movement toward opponent when safe
+    if abs(player_to_opponent) > 1.0 and is_safe:  # Only if not already very close and safe
+        if (player_to_opponent > 0 and movement > 0.01) or (player_to_opponent < 0 and movement < -0.01):
+            return 0.08 * env.dt
+        elif (player_to_opponent > 0 and movement < -0.01) or (player_to_opponent < 0 and movement > 0.01):
+            return -0.04 * env.dt
+    
+    return 0.0
+
+def smart_platform_navigation_reward(env: WarehouseBrawl) -> float:
+    """Reward for using platforms intelligently to reach opponent"""
+    player: Player = env.objects["player"]
+    opponent: Player = env.objects["opponent"]
+    
+    reward = 0.0
+    
+    # Check if opponent is on the other side of a gap
+    player_x, player_y = player.body.position.x, player.body.position.y
+    opp_x, opp_y = opponent.body.position.x, opponent.body.position.y
+    
+    # If opponent is on other side and player uses platform to cross
+    if abs(opp_x - player_x) > 4.0:  # Opponent is far away on other side
+        if player_y > 2.0:  # Player is on a platform
+            # Reward for using platform to cross gap
+            reward += 0.1 * env.dt
+            
+            # Extra reward if moving toward opponent while on platform
+            if (opp_x > player_x and player.body.velocity.x > 0) or (opp_x < player_x and player.body.velocity.x < 0):
+                reward += 0.05 * env.dt
+    
+    return reward
+
+def safe_platform_landing_reward(env: WarehouseBrawl) -> float:
+    """Reward for safely landing on platforms and transitioning between them"""
+    player: Player = env.objects["player"]
+    
+    if not hasattr(env, 'prev_player_y'):
+        env.prev_player_y = player.body.position.y
+        return 0.0
+    
+    current_y = player.body.position.y
+    prev_y = env.prev_player_y
+    env.prev_player_y = current_y
+    
+    # Reward for successful platform landing (coming down onto platform)
+    if prev_y > current_y and 2.0 < current_y < 4.0:  # Landing on platform height
+        if abs(player.body.velocity.y) < 2.0:  # Controlled landing
+            return 0.2
+    
+    return 0.0
+
+def platform_to_platform_reward(env: WarehouseBrawl) -> float:
+    """Reward for successfully moving between platforms"""
+    player: Player = env.objects["player"]
+    opponent: Player = env.objects["opponent"]
+    
+    if not hasattr(env, 'platform_transition_start'):
+        env.platform_transition_start = None
+    
+    player_x, player_y = player.body.position.x, player.body.position.y
+    opp_x, opp_y = opponent.body.position.x, opponent.body.position.y
+    
+    # Check if starting platform transition
+    if player_y > 2.0 and env.platform_transition_start is None:
+        env.platform_transition_start = (player_x, player_y)
+    
+    # Check if successfully completed platform transition
+    if env.platform_transition_start is not None and player_y < 1.0:  # Back on ground
+        start_x, start_y = env.platform_transition_start
+        distance_traveled = abs(player_x - start_x)
+        
+        # Reward for covering significant distance via platforms
+        if distance_traveled > 3.0:
+            reward = 0.3
+            # Bonus if transition got closer to opponent
+            start_dist_to_opp = abs(start_x - opp_x)
+            current_dist_to_opp = abs(player_x - opp_x)
+            if current_dist_to_opp < start_dist_to_opp:
+                reward += 0.2
+        else:
+            reward = 0.1
+            
+        env.platform_transition_start = None
+        return reward
+    
+    return 0.0
+
+def avoid_stuck_platform_penalty(env: WarehouseBrawl) -> float:
+    """Penalty for getting stuck on platforms unnecessarily"""
+    player: Player = env.objects["player"]
+    opponent: Player = env.objects["opponent"]
+    
+    player_x, player_y = player.body.position.x, player.body.position.y
+    opp_x, opp_y = opponent.body.position.x, opponent.body.position.y
+    
+    # Penalty for staying on platform when opponent is easily reachable on ground
+    if player_y > 2.0 and opp_y < 1.0:  # On platform when opponent is on ground
+        horizontal_dist = abs(player_x - opp_x)
+        if horizontal_dist < 3.0:  # Close enough to engage without platforms
+            return -0.1 * env.dt
+    
+    return 0.0
+
+def symmetric_movement_reward(env: WarehouseBrawl) -> float:
+    """Reward for moving in both directions equally (prevents directional bias)"""
+    player: Player = env.objects["player"]
+    opponent: Player = env.objects["opponent"]
+    
+    if not hasattr(env, 'left_movement_count'):
+        env.left_movement_count = 0
+        env.right_movement_count = 0
+        env.last_movement_direction = 0
+    
+    # Track movement direction
+    current_velocity_x = player.body.velocity.x
+    
+    if current_velocity_x > 0.1:  # Moving right
+        env.right_movement_count += 1
+        env.last_movement_direction = 1
+    elif current_velocity_x < -0.1:  # Moving left
+        env.left_movement_count += 1
+        env.last_movement_direction = -1
+    
+    # Reward balanced movement (only check after some time)
+    total_movements = env.left_movement_count + env.right_movement_count
+    if total_movements > 50:
+        balance_ratio = min(env.left_movement_count, env.right_movement_count) / max(env.left_movement_count, env.right_movement_count)
+        if balance_ratio > 0.7:  # Good balance
+            return 0.02 * env.dt
+        elif balance_ratio < 0.3:  # Poor balance
+            return -0.01 * env.dt
+    
+    return 0.0
+
+def bidirectional_approach_reward(env: WarehouseBrawl) -> float:
+    """Reward for approaching opponent from both left and right sides"""
+    player: Player = env.objects["player"]
+    opponent: Player = env.objects["opponent"]
+    
+    if not hasattr(env, 'left_approaches'):
+        env.left_approaches = 0
+        env.right_approaches = 0
+    
+    player_x = player.body.position.x
+    opp_x = opponent.body.position.x
+    player_vel_x = player.body.velocity.x
+    
+    # Check if approaching opponent
+    distance = abs(player_x - opp_x)
+    if distance < 4.0 and abs(player_vel_x) > 0.5:
+        if player_x < opp_x and player_vel_x > 0:  # Approaching from left
+            env.left_approaches += 1
+            return 0.05
+        elif player_x > opp_x and player_vel_x < 0:  # Approaching from right
+            env.right_approaches += 1
+            return 0.05
+    
+    return 0.0
+
+def spawn_agnostic_aggression_reward(env: WarehouseBrawl) -> float:
+    """Reward aggression regardless of spawn position"""
+    player: Player = env.objects["player"]
+    opponent: Player = env.objects["opponent"]
+    
+    if not hasattr(env, 'initial_spawn_difference'):
+        # Record initial positions to understand spawn configuration
+        env.initial_spawn_difference = opponent.body.position.x - player.body.position.x
+    
+    current_distance = abs(player.body.position.x - opponent.body.position.x)
+    
+    # Reward for closing distance regardless of direction
+    if not hasattr(env, 'prev_distance'):
+        env.prev_distance = current_distance
+        return 0.0
+    
+    distance_change = env.prev_distance - current_distance
+    env.prev_distance = current_distance
+    
+    if distance_change > 0.1:  # Getting closer
+        return 0.08
+    elif distance_change < -0.2:  # Moving away significantly
+        return -0.04
+    
+    return 0.0
+
+def predict_respawn_position(env: WarehouseBrawl) -> float:
+    """Predict where opponent will respawn based on map layout"""
+    player: Player = env.objects["player"]
+    opponent: Player = env.objects["opponent"]
+    
+    player_x = player.body.position.x
+    
+    # Respawn logic based on map layout:
+    # - Ground1: Left platform at y=2.85, x=-7.0 to -2.0
+    # - Ground2: Right platform at y=0.85, x=2.0 to 7.0
+    # - Moving Stage: Between (1,0) and (-1,2)
+    
+    # If player is on right side, opponent respawns on left platform
+    if player_x > 0:
+        # Respawn on left platform (Ground1) - center at x=-4.5
+        return -4.5
+    else:
+        # Respawn on right platform (Ground2) - center at x=4.5
+        return 4.5
+
+def smart_respawn_anticipation_reward(env: WarehouseBrawl) -> float:
+    """Reward for moving toward opponent's respawn point using actual map coordinates"""
+    player: Player = env.objects["player"]
+    opponent: Player = env.objects["opponent"]
+    
+    # Check if opponent is KO'd
+    opp_state_name = opponent.state.__class__.__name__
+    is_opponent_KO = any(state in opp_state_name for state in ['Knockdown', 'KO', 'Dead', 'Respawning'])
+    
+    if is_opponent_KO:
+        player_x, player_y = player.body.position.x, player.body.position.y
+        target_respawn_x = predict_respawn_position(env)
+        
+        # Calculate optimal path to respawn point
+        distance_to_respawn = abs(player_x - target_respawn_x)
+        
+        if not hasattr(env, 'prev_respawn_distance'):
+            env.prev_respawn_distance = distance_to_respawn
+            return 0.0
+        
+        distance_change = env.prev_respawn_distance - distance_to_respawn
+        env.prev_respawn_distance = distance_to_respawn
+        
+        # Enhanced reward based on map awareness
+        reward = 0.0
+        
+        if distance_change > 0.05:  # Moving toward respawn point
+            reward += 0.1
+            
+            # Bonus for taking efficient path (considering platforms)
+            if _is_taking_efficient_path(env, player_x, player_y, target_respawn_x):
+                reward += 0.05
+                
+        elif distance_change < -0.05:  # Moving away from respawn point
+            reward -= 0.05
+        
+        return reward
+    
+    # Reset when opponent respawns
+    elif hasattr(env, 'prev_respawn_distance'):
+        del env.prev_respawn_distance
+    
+    return 0.0
+
+def _is_taking_efficient_path(env: WarehouseBrawl, player_x: float, player_y: float, target_x: float) -> bool:
+    """Check if player is taking an efficient path considering platform layout"""
+    # Platform coordinates from your description:
+    # Ground1: y=2.85, x=-7.0 to -2.0
+    # Ground2: y=0.85, x=2.0 to 7.0
+    # Moving Stage: between (1,0) and (-1,2)
+    
+    # Efficient path: use platforms when they help, avoid when unnecessary
+    requires_platform_crossing = (player_x < -2.0 and target_x > 2.0) or (player_x > 2.0 and target_x < -2.0)
+    
+    if requires_platform_crossing:
+        # Should use moving platform or jump between platforms
+        if player_y > 1.0:  # On platform height
+            return True
+    else:
+        # No platform needed, should stay on ground
+        if player_y < 1.5:  # On ground level
+            return True
+    
+    return False
+
+def platform_aware_movement_reward(env: WarehouseBrawl) -> float:
+    """Reward for intelligent platform usage based on actual map layout"""
+    player: Player = env.objects["player"]
+    opponent: Player = env.objects["opponent"]
+    
+    player_x, player_y = player.body.position.x, player.body.position.y
+    opp_x, opp_y = opponent.body.position.x, opponent.body.position.y
+    
+    reward = 0.0
+    
+    # Platform coordinates
+    left_platform_range = (-7.0, -2.0)   # Ground1
+    right_platform_range = (2.0, 7.0)     # Ground2
+    moving_platform_center_range = (-1.0, 1.0)  # Moving stage area
+    
+    # Check if on appropriate platform for current situation
+    horizontal_distance = abs(player_x - opp_x)
+    
+    # Use platforms when opponent is on opposite side
+    if (player_x < 0 and opp_x > 2.0) or (player_x > 0 and opp_x < -2.0):
+        # Opponent is on opposite side, should use platforms
+        if (left_platform_range[0] <= player_x <= left_platform_range[1] and player_y > 2.0) or \
+           (right_platform_range[0] <= player_x <= right_platform_range[1] and player_y > 0.85) or \
+           (moving_platform_center_range[0] <= player_x <= moving_platform_center_range[1] and player_y > 0.5):
+            reward += 0.08 * env.dt  # Good platform usage
+    else:
+        # Opponent is on same side, should use ground
+        if player_y < 1.5:  # On ground level
+            reward += 0.05 * env.dt  # Good ground positioning
+    
+    return reward
+
+def map_aware_edge_avoidance(env: WarehouseBrawl) -> float:
+    """Edge avoidance using actual map boundaries"""
+    player: Player = env.objects["player"]
+    
+    player_x, player_y = player.body.position.x, player.body.position.y
+    
+    # Map boundaries from your description
+    left_boundary = -7.45   # Screen width 14.9, so half is 7.45
+    right_boundary = 7.45
+    bottom_boundary = -4.97  # Screen height 9.94, so half is 4.97
+    
+    penalty = 0.0
+    
+    # Penalty for approaching screen edges
+    distance_to_left_edge = abs(player_x - left_boundary)
+    distance_to_right_edge = abs(player_x - right_boundary)
+    distance_to_bottom = abs(player_y - bottom_boundary)
+    
+    # Strong penalty near screen edges (death zones)
+    if distance_to_left_edge < 1.0 or distance_to_right_edge < 1.0:
+        penalty -= 0.3 * env.dt
+    elif distance_to_left_edge < 2.0 or distance_to_right_edge < 2.0:
+        penalty -= 0.15 * env.dt
+    
+    # Penalty for falling off (below ground level)
+    if player_y < bottom_boundary + 1.0:
+        penalty -= 0.2 * env.dt
+    
+    return penalty
+
+def optimal_platform_positioning_reward(env: WarehouseBrawl) -> float:
+    """Reward for positioning on optimal platforms for attack/defense"""
+    player: Player = env.objects["player"]
+    opponent: Player = env.objects["opponent"]
+    
+    player_x, player_y = player.body.position.x, player.body.position.y
+    opp_x, opp_y = opponent.body.position.x, opponent.body.position.y
+    
+    # Platform coordinates
+    left_platform_range = (-7.0, -2.0)
+    right_platform_range = (2.0, 7.0)
+    
+    reward = 0.0
+    
+    # Height advantage reward
+    if player_y > opp_y + 1.0:  # Significant height advantage
+        reward += 0.06 * env.dt
+    
+    # Platform-specific advantages
+    if left_platform_range[0] <= player_x <= left_platform_range[1] and abs(player_y - 2.85) < 0.5:
+        # On left platform - good for attacking right side
+        if opp_x > 0:  # Opponent is on right side
+            reward += 0.04 * env.dt
+    
+    if right_platform_range[0] <= player_x <= right_platform_range[1] and abs(player_y - 0.85) < 0.5:
+        # On right platform - good for attacking left side
+        if opp_x < 0:  # Opponent is on left side
+            reward += 0.04 * env.dt
+    
+    return reward
+
 # --------------------------------------------------------------------------------
 # ----------------------------- REWARD MANAGER -----------------------------------
 # --------------------------------------------------------------------------------
 
 def gen_reward_manager():
     reward_functions = {
-        # Combat rewards
-        'damage_interaction_reward': RewTerm(func=damage_interaction_reward, weight=2.0),
-        'aggressive_positioning_reward': RewTerm(func=aggressive_positioning_reward, weight=0.3),
-        'successful_attack_reward': RewTerm(func=successful_attack_reward, weight=1.5),
+        # COMBAT REWARDS - HIGH PRIORITY
+        'damage_interaction_reward': RewTerm(func=damage_interaction_reward, weight=4.0),
+        'successful_attack_reward': RewTerm(func=successful_attack_reward, weight=3.0),
+        'aggressive_positioning_reward': RewTerm(func=aggressive_positioning_reward, weight=2.0),
         
-        # Strategic rewards
+        # SYMMETRIC MOVEMENT REWARDS - NEW
+        'symmetric_movement_reward': RewTerm(func=symmetric_movement_reward, weight=1.0),
+        'bidirectional_approach_reward': RewTerm(func=bidirectional_approach_reward, weight=1.5),
+        'spawn_agnostic_aggression_reward': RewTerm(func=spawn_agnostic_aggression_reward, weight=2.0),
+        
+        # AGGRESSION REWARDS
+        'closing_distance_reward': RewTerm(func=smart_closing_distance_reward, weight=2.0),
+        'pressure_reward': RewTerm(func=pressure_reward, weight=2.5),
+        'relentless_reward': RewTerm(func=safe_relentless_reward, weight=1.5),
+        'aggression_reward': RewTerm(func=aggression_reward, weight=1.5),
+        'attack_frequency_reward': RewTerm(func=attack_frequency_reward, weight=1.2),
+        
+        # PLATFORM REWARDS
+        'smart_platform_navigation_reward': RewTerm(func=smart_platform_navigation_reward, weight=1.5),
+        'safe_platform_landing_reward': RewTerm(func=safe_platform_landing_reward, weight=1.0),
+        'platform_to_platform_reward': RewTerm(func=platform_to_platform_reward, weight=2.0),
+        'avoid_stuck_platform_penalty': RewTerm(func=avoid_stuck_platform_penalty, weight=-1.0),
+        
+        # ANTI-SUICIDE REWARDS
+        'suicide_penalty_reward': RewTerm(func=suicide_penalty_reward, weight=-8.0),
+        'ledge_penalty_reward': RewTerm(func=ledge_penalty_reward, weight=-2.0),
+        'center_stage_bonus_reward': RewTerm(func=center_stage_bonus_reward, weight=1.0),
+        'danger_zone_reward': RewTerm(func=danger_zone_reward, weight=1.5),
+        
+        # STRATEGIC REWARDS
         'weapon_advantage_reward': RewTerm(func=weapon_advantage_reward, weight=0.8),
-        'stage_control_reward': RewTerm(func=stage_control_reward, weight=0.2),
+        'stage_control_reward': RewTerm(func=stage_control_reward, weight=0.5),
+        'offensive_positioning_reward': RewTerm(func=offensive_positioning_reward, weight=0.6),
         
-        # Defense rewards
-        'defensive_positioning_reward': RewTerm(func=defensive_positioning_reward, weight=0.4),
-        'successful_dodge_reward': RewTerm(func=successful_dodge_reward, weight=1.2),
+        # DEFENSE REWARDS
+        'defensive_positioning_reward': RewTerm(func=defensive_positioning_reward, weight=0.05),
+        'successful_dodge_reward': RewTerm(func=successful_dodge_reward, weight=0.3),
+        'recovery_reward': RewTerm(func=recovery_reward, weight=1.0),
         
-        # Technical skill rewards
-        'movement_efficiency_reward': RewTerm(func=movement_efficiency_reward, weight=0.1),
-        'recovery_reward': RewTerm(func=recovery_reward, weight=2.0),
-        'excessive_input_penalty': RewTerm(func=holding_more_than_3_keys, weight=-0.02),
-        
-        # Risk management
-        'danger_zone_reward': RewTerm(func=danger_zone_reward, weight=0.6),
-        'ledge_risk_penalty': RewTerm(func=ledge_risk_penalty, weight=-0.8),
+        # TECHNICAL REWARDS
+        'movement_efficiency_reward': RewTerm(func=movement_efficiency_reward, weight=0.05),
+        'combo_aggression_reward': RewTerm(func=combo_aggression_reward, weight=0.5),
+        'excessive_input_penalty': RewTerm(func=holding_more_than_3_keys, weight=0.5),
+        'smart_respawn_anticipation_reward': RewTerm(func=smart_respawn_anticipation_reward, weight=2.0),
+        'platform_aware_movement_reward': RewTerm(func=platform_aware_movement_reward, weight=1.5),
+        'map_aware_edge_avoidance': RewTerm(func=map_aware_edge_avoidance, weight=-2.5),
+        'optimal_platform_positioning_reward': RewTerm(func=optimal_platform_positioning_reward, weight=1.2)
     }
     
     signal_subscriptions = {
@@ -550,41 +1123,58 @@ def gen_reward_manager():
 
 if __name__ == '__main__':
     # Use RecurrentPPO for better temporal understanding
-    my_agent = RecurrentPPOAgent()
+    my_agent = SB3Agent(sb3_class=PPO)
 
-    # Enhanced reward manager
+    # Enhanced reward manager with symmetric rewards
     reward_manager = gen_reward_manager()
     
     # Self-play handler
-    selfplay_handler = SelfPlayRandom(
-        partial(type(my_agent))
-    )
-
+    selfplay_handler = SelfPlayRandom(partial(type(my_agent)))
+    
+    # Create directory if it doesn't exist
+    save_dir = 'checkpoints/symmetric_training'  # New folder for retraining
+    os.makedirs(save_dir, exist_ok=True)
+    
     # Improved save settings
     save_handler = SaveHandler(
         agent=my_agent,
-        save_freq=25_000,  # Save more frequently for shorter training
-        max_saved=10,      # Keep fewer models
-        save_path='checkpoints',
-        run_name='quick_training',
+        save_freq=50_000,  # Save more frequently to track progress
+        max_saved=10,
+        save_path=save_dir,
+        run_name='rl_model',
         mode=SaveHandlerMode.FORCE
     )
 
-    # More balanced opponent mix
+    # Use the symmetric opponent mix from above
     opponent_specification = {
-        'self_play': (4, selfplay_handler),
-        'constant_agent': (2, partial(ConstantAgent)),
+        'self_play': (3, selfplay_handler),
         'based_agent': (2, partial(BasedAgent)),
-        'clockwork_agent': (1, partial(ClockworkAgent)),
+        'left_aggressive_agent': (1, partial(ClockworkAgent, action_sheet=[
+            (20, ['a', 'j']),  # Left + attack
+            (10, ['a']),       # Left movement
+            (5, ['w', 'j']),   # Jump attack
+        ])),
+        'right_aggressive_agent': (1, partial(ClockworkAgent, action_sheet=[
+            (20, ['d', 'j']),  # Right + attack  
+            (10, ['d']),       # Right movement
+            (5, ['w', 'j']),   # Jump attack
+        ])),
     }
+    
     opponent_cfg = OpponentsCfg(opponents=opponent_specification)
 
-    # Train with reasonable timesteps
+    # Train with more timesteps for symmetric behavior
+    print("🎯 Starting symmetric training...")
     train(my_agent,
         reward_manager,
         save_handler,
         opponent_cfg,
         CameraResolution.LOW,
-        train_timesteps=100_000,
+        train_timesteps=300_000,  # Longer training for symmetric behavior
         train_logging=TrainLogging.TO_FILE
     )
+
+    # Save the final model
+    final_model_path = os.path.join(save_dir, "rl-model.zip")
+    my_agent.save(final_model_path)
+    print(f"✅ Symmetric model saved as: {final_model_path}")

@@ -1,24 +1,33 @@
-# import skvideo
-# import skvideo.io
-from environment.environment import RenderMode
-from environment.agent import SB3Agent, CameraResolution, RecurrentPPOAgent, BasedAgent, UserInputAgent, ConstantAgent, run_match, run_real_time_match, gen_reward_manager
-from user.my_agent import SubmittedAgent, ConstantAgent
+from environment.environment import RenderMode, CameraResolution
+from environment.agent import run_real_time_match
+from user.train_agent import UserInputAgent, BasedAgent, ConstantAgent, ClockworkAgent, SB3Agent, RecurrentPPOAgent
+from user.my_agent import SubmittedAgent
+import pygame
+pygame.init()
+import os
 
-reward_manager = gen_reward_manager()
+# Check if the model file exists
+model_path = "C:/Users/Anson/AISQUARED-1/checkpoints/symmetric_training/rl-model.zip"
+print(f"Model exists: {os.path.exists(model_path)}")
 
-experiment_dir_1 = "experiment_6/" #input('Model experiment directory name (e.g. experiment_1): ')
-model_name_1 = "rl_model00_steps" #input('Name of first model (e.g. rl_model_100_steps): ')
+# If file doesn't exist, try to find it in other locations
+if not os.path.exists(model_path):
+    print("❌ Model file not found at specified path. Searching for alternatives...")
+    # Try relative path
+    alt_path = "checkpoints/advanced_training_v2/rl-model.zip"
+    if os.path.exists(alt_path):
+        model_path = alt_path
+        print(f"✅ Found model at: {alt_path}")
+    else:
+        print("❌ Model not found in alternative locations")
 
 my_agent = UserInputAgent()
-#opponent = SubmittedAgent(None)
-opponent = ConstantAgent()
-# my_agent = UserInputAgent()
-# opponent = ConstantAgent()
 
-num_matches = 2 #int(input('Number of matches: '))
-#opponent=BasedAgent()
-match_time = 50000000000
-# 270
+# Input your file path here in SubmittedAgent if you are loading a model:
+opponent = SubmittedAgent(file_path=model_path)
+
+match_time = 99999
+
 # Run a single real-time match
 run_real_time_match(
     agent_1=my_agent,
