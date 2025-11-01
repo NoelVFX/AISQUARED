@@ -3,8 +3,8 @@ import gdown
 from typing import Optional
 import numpy as np
 from environment.agent import Agent
-from stable_baselines3 import PPO
-from stable_baselines3.common.utils import constant_fn
+from stable_baselines3 import PPO, A2C # Sample RL Algo imports
+from sb3_contrib import RecurrentPPO # Importing an LSTM
 
 class SubmittedAgent(Agent):
     def __init__(self, file_path: str = None):
@@ -14,6 +14,10 @@ class SubmittedAgent(Agent):
         self._initialized = False
         self.last_action = None
         print(f"🎯 SubmittedAgent created with file: {file_path}")
+
+        # To run a TTNN model, you must maintain a pointer to the device and can be done by 
+        # uncommmenting the line below to use the device pointer
+        # self.mesh_device = ttnn.open_mesh_device(ttnn.MeshShape(1,1))
 
     def _initialize(self) -> None:
         if self._initialized:
@@ -81,31 +85,17 @@ class SubmittedAgent(Agent):
             if cycle % 25 == 0:
                 action = self.act_helper.press_keys(['j'], action)
         else:
-            # Shield and wait
-            action = self.act_helper.press_keys(['g'], action)
-            
-        # Always add some movement to prevent standing still
-        if cycle % 50 == 0:
-            action = self.act_helper.press_keys(['w'], action)  # Jump occasionally
-            
-        if self.step_count % 100 == 0:
-            print(f"🏃 Emergency movement (step {self.step_count}, cycle: {cycle})")
-            print(f"   Current action: {action}")
-            
-        return action
+            self.model = PPO.load(self.file_path)
 
-    def _debug_observation(self, obs):
-        """Debug information about the observation"""
-        if obs is not None and hasattr(obs, 'shape'):
-            print(f"👀 Observation shape: {obs.shape}")
-            print(f"👀 Observation type: {type(obs)}")
-            if hasattr(obs, 'dtype'):
-                print(f"👀 Observation dtype: {obs.dtype}")
-            
-            # Print some key observation values if available
-            if isinstance(obs, np.ndarray) and obs.size > 10:
-                print(f"👀 First 10 obs values: {obs[:10]}")
-        
+    def _gdown(self) -> str:
+        data_path = "rl-model.zip"
+        if not os.path.isfile(data_path):
+            print(f"Downloading {data_path}...")
+            # Place a link to your PUBLIC model data here. This is where we will download it from on the tournament server.
+            url = "https://drive.google.com/file/d/1JIokiBOrOClh8piclbMlpEEs6mj3H1HJ/view?usp=sharing"
+            gdown.download(url, output=data_path, fuzzy=True)
+        return data_path
+
     def predict(self, obs):
      if not self._initialized:
         self._initialize()
